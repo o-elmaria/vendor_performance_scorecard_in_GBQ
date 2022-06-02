@@ -1,0 +1,1721 @@
+-----------------------------------------------------------------------------------------------NO NEED TO EDIT ANYTHING BEYOND THIS PART---------------------------------------------------------------------------------------------------
+
+-- Step 1.0: Extract Hedwig's similarity scores for the entire catalog
+
+-- Step 1.1: Get the Hedwig scores for both geos (because table names cannot be paramterized) and then filter for one geo
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_comb_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_comb_de_catalog_static`
+OPTIONS(
+  expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT *
+FROM (
+    SELECT * FROM `wf-gcp-us-ae-recsvc-prod.hedwig.single_class_hedwig_recs_v3_321`  -- Hedwig table UK
+    UNION ALL
+    SELECT * FROM `wf-gcp-us-ae-recsvc-prod.hedwig.single_class_hedwig_recs_v3_368` -- Hedwig table DE
+) hed
+WHERE 1=1
+    AND hed.soid = 368; -- Filter for a specific store ID (321 for UK, 368 for DE)
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 1.2.0: Parse the Hedwig table's vector to extract the NN rankings
+
+-- Step 1.2.1: First, extract the important elements from the single_class_recs string (ClID and nearest neighbors)
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.tbl_nn_array_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.tbl_nn_array_de_catalog_static`
+OPTIONS(
+  expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  *,
+  REGEXP_EXTRACT(single_class_recs, r'\d{1,}', 2, 1) AS ClID, -- Extracts the class ID from the single_class_recs string 
+  REGEXP_EXTRACT_ALL(single_class_recs, r'[A-Z]\w+') AS NN_Array -- A regular expression fn that extracts all SKU names and stores them in an array
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_comb_de_catalog`; 
+-- The 2nd regular expression reads as follows --> Match any word character that starts with a capital letter in the alphabet 
+
+-- Step 1.2.2: Second, split the NN_array into rows and join the unnested elements to the original table. In addition, map the SKUs to their parent supplier IDs
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_parsed_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_parsed_de_catalog_static`
+OPTIONS(
+  expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT -- Main query: Joins the supplier IDs to the anchor and nearest neighbor SKUs (note: can include non-primary SuIDs) 
+  a.SoID,
+  cl.ClMkcID AS MkcID,
+  CAST(a.ClID AS INT64) AS ClID,
+  a.Anchor_SKU, 
+  a.NNs,
+  a.NN_rank, -- The nearest neighbor with NN_rank = 1 is the closest SKU to the anchor SKU according to the Hedwig model
+  a.single_class_recs,
+  FORMAT("%T", ARRAY_AGG(DISTINCT anc.ParentSUID ORDER BY anc.ParentSUID)) AS ParentSuID_AnchorSKU, -- Map each anchor SKU to its parent supplier(s) - Output is a string of SuIDs
+  FORMAT("%T", ARRAY_AGG(DISTINCT nn.ParentSUID ORDER BY nn.ParentSUID)) AS ParentSuID_NNs -- Map each nearest neighbor SKU to its parent supplier(s) - Output is a string of SuIDs
+FROM (
+SELECT -- Sub-query: Splits the array into rows and joins the unnested elements to the original table
+  soid AS SoID,
+  ClID,
+  sku AS Anchor_SKU, 
+  NNs,
+  ROW_NUMBER() OVER (PARTITION BY ClID, sku) AS NN_rank, -- The nearest neighbor with NN_rank = 1 is the closest SKU to the anchor SKU according to the Hedwig model
+  single_class_recs
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.tbl_nn_array_de_catalog`
+CROSS JOIN UNNEST(`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.tbl_nn_array_de_catalog`.NN_Array) AS NNs -- Splits the array into rows, with each row corresponding to a single element in the array, then joins that to the tbl_NN_array table
+) a
+LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_class` cl ON CAST(a.ClID AS INT64) = cl.ClID
+LEFT JOIN `wf-gcp-us-ae-ops-prod.analyticstech_reporting.tbl_dim_product` nn ON a.NNs = nn.Product[SAFE_OFFSET(0)].SKU AND nn.IsActiveSupplierPart = TRUE -- The LEFT JOIN has to be like this due to the table's name (Product.SKU). IsActiveSupplier part eliminates suppliers that are not active with WF anymore
+LEFT JOIN `wf-gcp-us-ae-ops-prod.analyticstech_reporting.tbl_dim_product` anc ON a.Anchor_SKU = anc.Product[SAFE_OFFSET(0)].SKU AND anc.IsActiveSupplierPart = TRUE -- The LEFT JOIN has to be like this due to the table's name (Product.SKU). IsActiveSupplier part eliminates suppliers that are not active with WF anymore
+GROUP BY 1,2,3,4,5,6,7 -- Groups by the columns in the sub-query + MkcID
+ORDER BY 1,2,3,4,6; -- Order by SoID, MkcID, ClID, Anchor_SKU, and NN_rank
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.0: Extract the business metrics for the anchor and NN SKUs in "cm_fp_hedwig_scores_parsed_de_catalog"
+
+-- Step 2.1: Get a list of all distinct anchor and NN SKUs from "cm_fp_hedwig_scores_parsed_de_catalog"
+ 
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog_static` 
+OPTIONS(
+  expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT DISTINCT PrSKU
+FROM
+(
+  SELECT DISTINCT NNs AS PrSKU, 'NN' AS Identifier
+  FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_parsed_de_catalog`
+  UNION ALL
+  SELECT DISTINCT Anchor_SKU AS PrSKU, 'Anchor' AS Identifier
+  FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_parsed_de_catalog`
+)
+ORDER BY PrSKU;
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.2.0: Get the monthly GRS and orders. Time frame: Last 7 months dating back from today. Cadence: Monthly
+-- Important note: Don't join the retail cube table to the Orca table because the retail cube contains duplicate records for the same OpID, each record corresponding to a certain marketing channel
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_grs_orders_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_grs_orders_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+/* 
+We CROSS JOIN the full list of calendar months from t-7 months until today to the entire list of hedwig SKUs, then left join the GRS and order data to that dataset
+This way, we have a complete list of dates and SKUs, ensuring that we don't lose records where we don't have GRS or order data
+*/
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  COALESCE(x.GRS, 0) AS Agg_Monthly_GRS,
+  COALESCE(x.TotalOrderCount, 0) AS Agg_Monthly_TOC 
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+LEFT JOIN (
+  SELECT 
+    DATE_TRUNC(rt.orderdate, MONTH) AS Datum, 
+    rt.soid,
+    pr.OpPrSKU,
+    SUM(grossrevenuestable) AS GRS,
+    COUNT(DISTINCT rt.orid) AS TotalOrderCount -- Use OrID and not OpID to get the total order count
+  FROM `wf-gcp-us-ae-retail-prod.cm_reporting.retail_fact_order_product_revenue_cost` rt -- Table containing the commercial metrics
+  JOIN `wf-gcp-us-ae-retail-prod.cm_reporting.retail_dim_order` AS retailor ON retailor.orderkey = rt.orderkey -- Table containing the field that is used to identify cancelled and uncancelled orders
+  JOIN `wf-gcp-us-ae-sql-data-prod.elt_order.tbl_order_product` pr ON rt.opid = pr.opid and rt.soid = pr.OpSoID -- INNER JOIN because we ALWAYS need to map OpIDs to SKUs. We cannot have missing values in the SKU column
+  JOIN `wf-gcp-us-ae-sql-data-prod.elt_order.tbl_order` d ON d.orid = pr.oporid -- For excluding "External Order Source" in the WHERE clause 
+  WHERE 1=1
+    AND CAST(rt.orderdate AS DATE) >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'OrderDate' timeline from the start of the month 7 months ago
+    AND rt.soid = 368 -- 321 for UK; 368 for DE
+    AND businesssector = 0 -- Direct online
+    AND retailor.orcancelled != 1 -- Exclude cancellations
+    AND pr.OpPrSKU IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Includes the anchor SKUs and NNs
+    AND d.orosid != 17 -- Exclude External Order Source
+  GROUP BY 1,2,3
+  ORDER BY 2,3,1
+) x ON x.Datum = mon.Datum AND x.OpPrSKU = hed.PrSKU 
+ORDER BY 2,3,1;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.3.0: Historical WSC and COGS trend (Last landed 4 months) - Time frame: t-7 to t-4 months dating back from today. Cadence: Monthly 
+/*
+Aggregation method:
+  - First, the landed cost components for each SKU are caclulated on a monthly basis as per May Zhang's COGS script (Find "Query Part 1" below)
+  - Second, incidence ratio and RAR outliers are removed from the aggregated numbers (Find "Query Part 2" below)
+  - Third, revenue-weighted average, simple average, and median on SKU-month level for each COGS component are calculated (Find "Query Part 3.1" and "Query Part 3.2" below)
+  - The data that we obtain corresponds to the SKUs which had orders in the in the t-7 to t-4 timeframe
+    All other SKUs will have NULL values. For these SKUs, we use the historical PIT B2C estimates as a filler (step 2.3.1)
+
+Note: The records extracted from the Orca table will always have revenue data associated with them *by definition* because Orca is an order-based source 
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_landed_cogs_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_landed_cogs_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT -- Query Part 3.1: This is the part where we do the aggregations on SKU-month level: revenue-weighting, simple averaging, and median
+stag3.Month AS Datum,
+stag3.SoID,
+stag3.PrSKU,
+
+-- WSC
+COALESCE(SUM(stag3.WSC_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0), AVG(stag3.WSC_Month)) AS RevW_WSC_hist_landed, -- Use the normal avg as a filler whenever revenue-weighting is not possible
+CASE WHEN SUM(stag3.WSC_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_WSC_hist_landed_Flag,
+AVG(stag3.WSC_Month) AS Avg_WSC_hist_landed,
+AVG(stag3.Median_WSC_hist_landed_staging) AS Median_WSC_hist_landed,
+
+-- RAR
+COALESCE(SUM(stag3.RAR_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0), AVG(stag3.RAR_Month)) AS RevW_RAR_hist_landed, -- Use the normal avg as a filler whenever revenue-weighting is not possible
+CASE WHEN SUM(stag3.RAR_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_RAR_hist_landed_Flag,
+AVG(stag3.RAR_Month) AS Avg_RAR_hist_landed,
+AVG(Median_RAR_hist_landed_staging) AS Median_RAR_hist_landed,
+
+-- Incidence Ratio
+COALESCE(SUM(stag3.IncRatio_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0), AVG(stag3.IncRatio_Month)) AS RevW_IncRatio_hist_landed, -- Use the normal avg as a filler whenever revenue-weighting is not possible
+CASE WHEN SUM(stag3.IncRatio_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_IncRatio_hist_landed_Flag,
+AVG(stag3.IncRatio_Month) AS Avg_IncRatio_hist_landed,
+AVG(Median_IncRatio_hist_landed_staging) AS Median_IncRatio_hist_landed,
+
+-- Ship cost share of COGS
+COALESCE(SUM(stag3.SCCOGS_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0), AVG(stag3.SCCOGS_Month)) AS RevW_SCCOGS_hist_landed, -- Use the normal avg as a filler whenever revenue-weighting is not possible
+CASE WHEN SUM(stag3.SCCOGS_Month * stag3.GRS_Month) / NULLIF(SUM(stag3.GRS_Month),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_SCCOGS_hist_landed_Flag,
+AVG(stag3.SCCOGS_Month) AS Avg_SCCOGS_hist_landed,
+AVG(Median_SCCOGS_hist_landed_staging) AS Median_SCCOGS_hist_landed,
+
+-- Incidences and ship cost share of COGS
+COALESCE(SUM(stag3.Inc_And_SC_ShareOfCOGS_Month * stag3.GRS_Month ) / NULLIF(SUM(stag3.GRS_Month),0), AVG(stag3.Inc_And_SC_ShareOfCOGS_Month)) AS RevW_Inc_And_SC_ShareOfCOGS_hist_landed, -- Use the normal avg as a filler whenever revenue-weighting is not possible
+CASE WHEN SUM(stag3.Inc_And_SC_ShareOfCOGS_Month * stag3.GRS_Month ) / NULLIF(SUM(stag3.GRS_Month),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_Inc_And_SC_ShareOfCOGS_hist_landed_Flag,
+AVG(stag3.Inc_And_SC_ShareOfCOGS_Month) AS Avg_Inc_And_SC_ShareOfCOGS_hist_landed,
+AVG(Median_Inc_And_SC_ShareOfCOGS_hist_landed_staging) AS Median_Inc_And_SC_ShareOfCOGS_hist_landed
+
+FROM (
+  SELECT -- Query Part 3.2: This sub-query calculates the median for every COGS component per SKU-month
+    stag2.*,
+
+    PERCENTILE_CONT(stag2.WSC_Month, 0.5) OVER (PARTITION BY stag2.SoID, stag2.Month, stag2.prsku) AS Median_WSC_hist_landed_staging,
+    PERCENTILE_CONT(stag2.RAR_Month, 0.5) OVER (PARTITION BY stag2.SoID, stag2.Month, stag2.prsku) AS Median_RAR_hist_landed_staging,
+    PERCENTILE_CONT(stag2.IncRatio_Month, 0.5) OVER (PARTITION BY stag2.SoID, stag2.Month, stag2.prsku) AS Median_IncRatio_hist_landed_staging,
+    PERCENTILE_CONT(stag2.SCCOGS_Month, 0.5) OVER (PARTITION BY stag2.SoID, stag2.Month, stag2.prsku) AS Median_SCCOGS_hist_landed_staging,
+    PERCENTILE_CONT(stag2.Inc_And_SC_ShareOfCOGS_Month, 0.5) OVER (PARTITION BY stag2.SoID, stag2.Month, stag2.prsku) AS Median_Inc_And_SC_ShareOfCOGS_hist_landed_staging
+
+  FROM (
+    SELECT -- Query Part 2: This sub-query is used to apply safe guards to get rid of outliers in landed costs (0 <= IncRatio & Shipping (independently and combined) <= 0.8; 0.6 <= RAR <= 1)
+      stag.Month,
+      stag.SoID,
+      stag.PrSKU,
+      stag.manufacturerpartid,
+      stag.WSC_month,
+      CASE WHEN RAR_Month < 0.6 THEN 0.6 WHEN RAR_Month > 1.0 THEN 1.0 ELSE RAR_Month END AS RAR_Month,
+      CASE WHEN IncRatio_Month > 0.8 THEN 0.8 WHEN IncRatio_Month < 0 THEN 0 ELSE IncRatio_Month END AS IncRatio_Month,
+      CASE WHEN SCCOGS_Month > 0.8 THEN 0.8 WHEN SCCOGS_Month < 0 THEN 0 ELSE SCCOGS_Month END AS SCCOGS_Month, 
+      CASE WHEN Inc_And_SC_ShareOfCOGS_Month > 0.8 THEN 0.8 WHEN Inc_And_SC_ShareOfCOGS_Month < 0 THEN 0 ELSE Inc_And_SC_ShareOfCOGS_Month END AS Inc_And_SC_ShareOfCOGS_Month,
+      stag.GRS_Month
+
+      FROM (
+        SELECT -- Query Part 1: This is where we calculate the landed costs per MpID on a monthly basis from Orca
+          DATE_TRUNC(CAST(orca.orcompletedate AS DATE), MONTH) AS Month,
+          orca.soid AS SoID,
+          orca.prsku AS PrSKU,
+          orca.manufacturerpartid,
+          SUM(orca.ProductCostDTP) / NULLIF(SUM(OriginalOpQty),0) AS WSC_Month,
+          SUM(orca.NetRevenuePreTax + orca.NonEventProductPromoDTP + orca.NonEventShipPromoDTP) / NULLIF(SUM(orca.SalePriceOnSitePerQtyPreTax * orca.OriginalOpQty + orca.ShipRevenueDTP - orca.EventProductPromoDTP - orca.EventShipPromoDTP +
+          IFNULL(orca.B2BSalesDiscountRevenueDTP,0)),0) AS RAR_Month,
+          SUM(orca.IncidentsEtAlPostHocProductCost) / NULLIF(SUM(orca.ProductCostDTP),0) AS IncRatio_Month,
+          SUM(orca.ShippingCost) / NULLIF(SUM(orca.TotalCostPreTax),0) AS SCCOGS_Month,
+          SUM(orca.ShippingCost + IncidentsEtAlPostHocProductCost) / NULLIF(SUM(orca.TotalCostPreTax),0) AS Inc_And_SC_ShareOfCOGS_Month, 
+          SUM(orca.SalePriceOnSitePerQtyPreTax * orca.OriginalOpQty + orca.ShipRevenueDTP) AS GRS_Month
+        FROM `wf-gcp-us-ae-pricing-prod.pricing_dw.tbl_part_original_opid_revenue_cost_actuals` orca
+        WHERE 1=1
+          AND (
+          CAST(orca.OrCompleteDate AS DATE) >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH)
+          AND 
+          CAST(orca.OrCompleteDate AS DATE) < DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -3 MONTH), MONTH)
+          ) -- Include the *completed*, most recent 4 landed months
+          AND orca.soid = 368 -- Filter only for the store ID that belongs to the chosen supplier-class combination
+          AND orca.prsku IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Includes the anchor SKUs and NNs
+          AND orca.CancelledOriginalOpQty = 0 -- Excludes cancelled orders (cancellations do not incur cost for Wayfair)
+          AND orca.isGiftCardPurchase = 0 -- Removes gift cards (gift cards tend to overstate revenue and margin)
+          AND orca.TotalLiquidationDiscountRevenuePreTax = 0 -- Removes liquidation orders (liquidations are one-off warehouse events and will lead to extreme adjustments; also unfair to distribute across short 3-month timeframe)
+          AND orca.ProductCostDTP > 0 -- Ignore orders with $0 original costs (zero-cost tile/fabric samples and other odd items that should not impact pricing)
+          AND orca.SalePriceOnSitePerQtyPreTax > 0 -- Ignore free stuff to avoid wrong TOC (Some products are shipped as multiple OpIDs, some of which are free in some cases, e.g. you buy a bed and it comes with a free bolt-set, but we also sell the bolt set alone)
+          AND orca.OriginalResoldOpQty = 0 -- Excludes open box / resold products
+          AND ABS(orca.ProductCostDTP / orca.OriginalOpQty - 9999) >= .005 -- Ignore default value cases where ProductCostDTP is a multiple of 9999
+        GROUP BY 1,2,3,4
+        ORDER BY 2,3,1,4
+      ) stag
+  ) stag2
+) stag3
+GROUP BY 1,2,3
+ORDER BY 2,3,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.3.1: Historical WSC and COGS trend (Most recent unlanded 3 months + another 4 months before that to account for missing landed data in step 2.3)
+-- Time frame: t-7 months to today. Cadence: Monthly
+
+/* 
+Aggregation method: 
+  - Revenue-weighted average + simple average + median (i.e. 3 columns per COGS component) on a monthly basis per SKU. In other words, Grouping variables are "month" and "SKU"
+  - We first average the daily MpID-level WSC values across each month, then apply the median to aggregate to SKU-month level
+  - 90D GRS from the tbl_part_data_aggregates table is used to attach a revenue figure to each MpID 
+  - For revenue-weighted columns, if revenue data doesn't exist for any SKU's MpID, simple averaging is used
+Assumption: The MpID to SKU mapping can change over time. We assume that the *current* mapping had NOT changed over the last 7 months
+The mapping is done by inner joining "tbl_pit_pricing_inputs_b2c" on "tbl_option_combination"
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_unlanded_cogs_pit_est_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_unlanded_cogs_pit_est_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT  -- This SELECT statement aggregates historical, MpID level WSC and COGS estimates to SKU level using 3 methods, simple average, rev-weighting, and median
+  Datum,
+  CASE WHEN PpiBclgId = 2 THEN 321 ELSE 368 END AS SoID,
+  PrSKU,
+  
+  -- WSC
+  COALESCE(SUM(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg * GRS90D) / NULLIF(SUM(GRS90D),0), AVG(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg)) AS RevW_WSC_hist_unlanded,
+  CASE WHEN SUM(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg * GRS90D) / NULLIF(SUM(GRS90D),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_WSC_hist_unlanded_Flag,
+  AVG(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg) AS Avg_WSC_hist_unlanded,
+  AVG(Median_WSC_hist_unlanded_staging) AS Median_WSC_hist_unlanded,
+  
+  -- RAR
+  COALESCE(SUM(PpiPricingRevenueAdjustmentRatioB2C_MpIDMonthAvg * GRS90D) / NULLIF(SUM(GRS90D),0), AVG(PpiPricingRevenueAdjustmentRatioB2C_MpIDMonthAvg)) AS RevW_RAR_hist_unlanded,
+  CASE WHEN SUM(PpiPricingRevenueAdjustmentRatioB2C_MpIDMonthAvg * GRS90D) / NULLIF(SUM(GRS90D),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_RAR_hist_unlanded_Flag,
+  AVG(PpiPricingRevenueAdjustmentRatioB2C_MpIDMonthAvg) AS Avg_RAR_hist_unlanded,
+  AVG(Median_RAR_hist_unlanded_staging) AS Median_RAR_hist_unlanded,
+
+  -- Incidence Ratio
+  COALESCE(SUM(PpiPricingProductIncidentCostB2C_MpIDMonthAvg / NULLIF(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg,0) * GRS90D) / NULLIF(SUM(GRS90D),0), AVG(PpiPricingProductIncidentCostB2C_MpIDMonthAvg / NULLIF(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg,0))) AS RevW_IncRatio_hist_unlanded,
+  CASE WHEN SUM(PpiPricingProductIncidentCostB2C_MpIDMonthAvg / NULLIF(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg,0) * GRS90D) / NULLIF(SUM(GRS90D),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_IncRatio_hist_unlanded_Flag,
+  AVG(PpiPricingProductIncidentCostB2C_MpIDMonthAvg / NULLIF(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg,0)) AS Avg_IncRatio_hist_unlanded,
+  AVG(Median_IncRatio_hist_unlanded_staging) AS Median_IncRatio_hist_unlanded,
+
+  -- Ship cost share of COGS
+  COALESCE(SUM(PpiPricingShippingOutboundCostB2C_MpIDMonthAvg / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0) * GRS90D) / NULLIF(SUM(GRS90D),0), AVG(PpiPricingShippingOutboundCostB2C_MpIDMonthAvg / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0))) AS RevW_SCCOGS_hist_unlanded,
+  CASE WHEN SUM(PpiPricingShippingOutboundCostB2C_MpIDMonthAvg / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0) * GRS90D) / NULLIF(SUM(GRS90D),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_SCCOGS_hist_unlanded_Flag,
+  AVG(PpiPricingShippingOutboundCostB2C_MpIDMonthAvg / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0)) AS Avg_SCCOGS_hist_unlanded,
+  AVG(Median_SCCOGS_hist_unlanded_staging) AS Median_SCCOGS_hist_unlanded,
+
+  -- Incidences AND ship cost share of COGS
+  COALESCE(
+    SUM((PpiPricingShippingOutboundCostB2C_MpIDMonthAvg + PpiPricingProductIncidentCostB2C_MpIDMonthAvg) / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0) * GRS90D) / NULLIF(SUM(GRS90D),0), 
+    AVG((PpiPricingShippingOutboundCostB2C_MpIDMonthAvg + PpiPricingProductIncidentCostB2C_MpIDMonthAvg) / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0))
+  ) AS RevW_Inc_And_SC_ShareOfCOGS_hist_unlanded,
+  CASE WHEN SUM((PpiPricingShippingOutboundCostB2C_MpIDMonthAvg + PpiPricingProductIncidentCostB2C_MpIDMonthAvg) / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0) * GRS90D) / NULLIF(SUM(GRS90D),0) IS NOT NULL THEN 'RevW - Rev Data Exists' ELSE 'Avg - No Rev Data' END AS RevW_Inc_And_SC_ShareOfCOGS_hist_unlanded_Flag,
+  AVG((PpiPricingShippingOutboundCostB2C_MpIDMonthAvg + PpiPricingProductIncidentCostB2C_MpIDMonthAvg) / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0)) AS Avg_Inc_And_SC_ShareOfCOGS_hist_unlanded,
+  AVG(Median_Inc_And_SC_ShareOfCOGS_hist_unlanded_staging) AS Median_Inc_And_SC_ShareOfCOGS_hist_unlanded
+
+FROM (
+  SELECT -- This sub-query calculates the median for every COGS component per SKU-month
+    stag.*,
+    PERCENTILE_CONT(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg, 0.5) OVER (PARTITION BY PpiBclgId, PrSKU, Datum) AS Median_WSC_hist_unlanded_staging,
+    PERCENTILE_CONT(PpiPricingRevenueAdjustmentRatioB2C_MpIDMonthAvg, 0.5) OVER (PARTITION BY PpiBclgId, PrSKU, Datum) AS Median_RAR_hist_unlanded_staging,
+    PERCENTILE_CONT(PpiPricingProductIncidentCostB2C_MpIDMonthAvg / NULLIF(PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg,0), 0.5) OVER (PARTITION BY PpiBclgId, PrSKU, Datum) AS Median_IncRatio_hist_unlanded_staging,
+    PERCENTILE_CONT(PpiPricingShippingOutboundCostB2C_MpIDMonthAvg / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0), 0.5) OVER (PARTITION BY PpiBclgId, PrSKU, Datum) AS Median_SCCOGS_hist_unlanded_staging,
+    PERCENTILE_CONT((PpiPricingShippingOutboundCostB2C_MpIDMonthAvg + PpiPricingProductIncidentCostB2C_MpIDMonthAvg) / NULLIF(PpiPricingTotalCostB2C_MpIDMonthAvg,0), 0.5) OVER (PARTITION BY PpiBclgId, PrSKU, Datum) AS Median_Inc_And_SC_ShareOfCOGS_hist_unlanded_staging,
+
+  FROM (
+    SELECT -- This sub-query pulls historical COGS estimates on MpID level and averages the estimates over each month for the last 7 months to arrive at a single estimate per MpID-month
+      DATE_TRUNC(CAST(LEFT(PpiTimeCaptured,10) AS DATE), MONTH) AS Datum,
+      pit.PpiBclgId,
+      pit.PpiManufacturerPartId,
+      oc.PrSKU,
+      agg.GRS90D AS GRS90D,
+      AVG(pit.PpiEverydayDropshipWholesaleB2C) AS PpiEverydayDropshipWholesaleB2C_MpIDMonthAvg,
+      AVG(pit.PpiPricingRevenueAdjustmentRatioB2C) AS PpiPricingRevenueAdjustmentRatioB2C_MpIDMonthAvg,
+      AVG(pit.PpiPricingProductIncidentCostB2C) AS PpiPricingProductIncidentCostB2C_MpIDMonthAvg,
+      AVG(pit.PpiPricingShippingOutboundCostB2C) AS PpiPricingShippingOutboundCostB2C_MpIDMonthAvg,
+      AVG(pit.PpiPricingTotalCostB2C) AS PpiPricingTotalCostB2C_MpIDMonthAvg
+    FROM `wf-gcp-us-ae-bulk-prod.csn_pricing_historical.tbl_pit_pricing_inputs_b2c` pit
+    JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_option_combination` oc ON pit.PpiManufacturerPartId = oc.ManufacturerPartID
+    /* 
+    Mapping MpID to SKU cannot be done together with a BclgID column. Hence, this query can only be run for ONE Geo at a time
+    When joining MpIDs on SKUs, duplicates will occur due to two reasons:
+
+    1) The same MpID gets matched to multiple SKUs (Filtering for the SKUs in the hedwig table takes care of this issue)
+    2) The same SKU gets matched to multiple MpIDs (averaging takes care of this issue)
+    3) The same MpID gets matched to the same SKUs but in more than one geo (filtering the BclgID column in the hydros tables (current or historical) takes care of this issue) 
+    */
+    LEFT JOIN ( -- This sub-query calculates the 90D GRS of all MpIDs linked to the SKUs in "cm_fp_hedwig_skus_de_catalog". The 90D GRS will be used for rev-weighting. We do the join like this because the MpIDs in tbl_part_data_aggregates could be spread across multiple suppliers
+      SELECT 
+        BclgID, 
+        ManufacturerPartId,
+        SUM(GRS90D) AS GRS90D 
+      FROM `wf-gcp-us-ae-pricing-prod.profit_mgmt.tbl_part_data_aggregates`
+      WHERE BclgID = 3 AND PrSKU IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`)
+      GROUP BY 1,2
+    ) agg ON pit.PpiManufacturerPartId = agg.ManufacturerPartId AND pit.PpiBclgId = agg.BclgID -- The left join is vital here because maybe some MpIDs in "tbl_pit_pricing_inputs_b2c" are not available in "tbl_part_data_aggregates"
+
+    WHERE 1=1
+      AND PpiBclgId = 3 -- Filter for a specific geo. This filter is EXTREMELY IMPORTANT. Please don't use more than one at a time. Otherwise, you will combine UK with DE estimates
+      AND (CAST(LEFT(PpiTimeCaptured,10) AS DATE) >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH)) -- Begin the timeline from the start of the month 7 months ago
+      AND oc.PrSKU IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Includes the anchor SKUs and NNs
+    GROUP BY 1,2,3,4,5
+  ) stag
+) stag2
+GROUP BY 1,2,3
+ORDER BY 2,3,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.3.2: Joining the historical landed (from Orca) and historical unlanded (from the PIT tbl) WSC/COGS
+-- In addition to using the PIT estimates to populate the data for the most recent unlanded 3 months, we also use them as fillers for SKUs which had no orders in the *landed* timeframe
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_cogs_all_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_cogs_all_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  -- COALESCE statement "1" populates the respective fields with the landed numbers if they exist or the historical PIT estimate where they don't
+  -- COALESCE statement "2" informs the user if the RevW figure is an actual RevW figure or a normal average because revenue data does not exist
+  
+  -- WSC
+  ROUND(COALESCE(RevW_WSC_hist_landed, RevW_WSC_hist_unlanded), 2) AS RevW_WSC_hist,
+  CASE WHEN RevW_WSC_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS RevW_WSC_hist_LandedvsPIT_Flag,
+  COALESCE(RevW_WSC_hist_landed_Flag, RevW_WSC_hist_unlanded_Flag) AS RevW_WSC_hist_RevWvsAvg_Flag,
+  
+  ROUND(COALESCE(Avg_WSC_hist_landed , Avg_WSC_hist_unlanded), 2) AS Avg_WSC_hist,
+  CASE WHEN Avg_WSC_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Avg_WSC_hist_LandedvsPIT_Flag,
+  
+  ROUND(COALESCE(Median_WSC_hist_landed , Median_WSC_hist_unlanded), 2) AS Median_WSC_hist,
+  CASE WHEN Median_WSC_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Median_WSC_hist_LandedvsPIT_Flag,
+
+  -- RAR
+  ROUND(COALESCE(RevW_RAR_hist_landed, RevW_RAR_hist_unlanded), 4) AS RevW_RAR_hist,
+  CASE WHEN RevW_RAR_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS RevW_RAR_hist_LandedvsPIT_Flag,
+  COALESCE(RevW_RAR_hist_landed_Flag, RevW_RAR_hist_unlanded_Flag) AS RevW_RAR_hist_RevWvsAvg_Flag,
+  
+  ROUND(COALESCE(Avg_RAR_hist_landed, Avg_RAR_hist_unlanded), 4) AS Avg_RAR_hist,
+  CASE WHEN Avg_RAR_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Avg_RAR_hist_LandedvsPIT_Flag,
+
+  ROUND(COALESCE(Median_RAR_hist_landed , Median_RAR_hist_unlanded), 2) AS Median_RAR_hist,
+  CASE WHEN Median_RAR_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Median_RAR_hist_LandedvsPIT_Flag,
+
+  -- Incidence Ratio
+  ROUND(COALESCE(RevW_IncRatio_hist_landed, RevW_IncRatio_hist_unlanded), 4) AS RevW_IncRatio_hist,
+  CASE WHEN RevW_IncRatio_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS RevW_IncRatio_hist_LandedvsPIT_Flag,
+  COALESCE(RevW_IncRatio_hist_landed_Flag, RevW_IncRatio_hist_unlanded_Flag) AS RevW_IncRatio_hist_RevWvsAvg_Flag,
+  
+  ROUND(COALESCE(Avg_IncRatio_hist_landed, Avg_IncRatio_hist_unlanded), 4) AS Avg_IncRatio_hist,
+  CASE WHEN Avg_IncRatio_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Avg_IncRatio_hist_LandedvsPIT_Flag,
+
+  ROUND(COALESCE(Median_IncRatio_hist_landed , Median_IncRatio_hist_unlanded), 2) AS Median_IncRatio_hist,
+  CASE WHEN Median_IncRatio_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Median_IncRatio_hist_LandedvsPIT_Flag,
+
+  -- Ship cost share of COGS
+  ROUND(COALESCE(RevW_SCCOGS_hist_landed, RevW_SCCOGS_hist_unlanded), 4) AS RevW_SCCOGS_hist,
+  CASE WHEN RevW_SCCOGS_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS RevW_SCCOGS_hist_LandedvsPIT_Flag,
+  COALESCE(RevW_SCCOGS_hist_landed_Flag, RevW_SCCOGS_hist_unlanded_Flag) AS RevW_SCCOGS_hist_RevWvsAvg_Flag,
+  
+  ROUND(COALESCE(Avg_SCCOGS_hist_landed, Avg_SCCOGS_hist_unlanded), 4) AS Avg_SCCOGS_hist,
+  CASE WHEN Avg_SCCOGS_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Avg_SCCOGS_hist_LandedvsPIT_Flag,
+
+  ROUND(COALESCE(Median_SCCOGS_hist_landed , Median_SCCOGS_hist_unlanded), 2) AS Median_SCCOGS_hist,
+  CASE WHEN Median_SCCOGS_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Median_SCCOGS_hist_LandedvsPIT_Flag,
+
+  -- Incidences and ship cost share of COGS
+  ROUND(COALESCE(RevW_Inc_And_SC_ShareOfCOGS_hist_landed, RevW_Inc_And_SC_ShareOfCOGS_hist_unlanded), 4) AS RevW_Inc_And_SC_ShareOfCOGS_hist,
+  CASE WHEN RevW_Inc_And_SC_ShareOfCOGS_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS RevW_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+  COALESCE(RevW_Inc_And_SC_ShareOfCOGS_hist_landed_Flag, RevW_Inc_And_SC_ShareOfCOGS_hist_unlanded_Flag) AS RevW_Inc_And_SC_ShareOfCOGS_hist_RevWvsAvg_Flag,
+  
+  ROUND(COALESCE(Avg_Inc_And_SC_ShareOfCOGS_hist_landed, Avg_Inc_And_SC_ShareOfCOGS_hist_unlanded), 4) AS Avg_Inc_And_SC_ShareOfCOGS_hist,
+  CASE WHEN Avg_Inc_And_SC_ShareOfCOGS_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Avg_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+
+  ROUND(COALESCE(Median_Inc_And_SC_ShareOfCOGS_hist_landed , Median_Inc_And_SC_ShareOfCOGS_hist_unlanded), 2) AS Median_Inc_And_SC_ShareOfCOGS_hist,
+  CASE WHEN Median_Inc_And_SC_ShareOfCOGS_hist_landed IS NOT NULL THEN 'Landed Number' ELSE 'PIT Hist Est' END AS Median_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_landed_cogs_de_catalog` hu ON hu.Datum = mon.Datum AND hu.PrSKU = hed.PrSKU
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_unlanded_cogs_pit_est_de_catalog` hl ON hl.Datum = mon.Datum AND hl.PrSKU = hed.PrSKU
+ORDER BY 2,3,1;
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.4.2: Historical WSC revenue per SKU to enable efficient sorting in the table of curated KPIs. Time frame: Last 7 months dating back from today. Cadence: Monthly
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_wsc_rev_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_wsc_rev_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  COALESCE(WSC_Revenue, 0) AS WSC_Revenue
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+LEFT JOIN (
+  SELECT
+    DATE_TRUNC(CAST(orca.OrCompleteDate AS DATE), MONTH) AS Datum,
+    orca.soid AS SoID,
+    orca.prsku AS PrSKU,
+    SUM(orca.ProductCostDTP) AS WSC_Revenue
+  FROM `wf-gcp-us-ae-pricing-prod.pricing_dw.tbl_part_original_opid_revenue_cost_actuals` orca
+  WHERE 1=1
+    AND CAST(orca.OrCompleteDate AS DATE) >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'SessionStartDate' timeline from the first day of the month 7 months ago
+    AND orca.soid = 368 -- Filter only for the store ID that belongs to the chosen supplier-class combination
+    AND orca.prsku IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Includes the anchor SKUs and NNs
+    AND orca.CancelledOriginalOpQty = 0 -- Excludes cancelled orders (cancellations do not incur cost for Wayfair)
+    AND orca.isGiftCardPurchase = 0 -- Removes gift cards (gift cards tend to overstate revenue and margin)
+    AND orca.TotalLiquidationDiscountRevenuePreTax = 0 -- Removes liquidation orders (liquidations are one-off warehouse events and will lead to extreme adjustments; also unfair to distribute across short 3-month timeframe)
+    AND orca.ProductCostDTP > 0 -- Ignore orders with $0 original costs (zero-cost tile/fabric samples and other odd items that should not impact pricing)
+    AND orca.SalePriceOnSitePerQtyPreTax > 0 -- Ignore free stuff to avoid wrong TOC (Some products are shipped as multiple OpIDs, some of which are free in some cases, e.g. you buy a bed and it comes with a free bolt-set, but we also sell the bolt set alone)
+    AND orca.OriginalResoldOpQty = 0 -- Excludes open box / resold products
+    AND ABS(orca.ProductCostDTP / orca.OriginalOpQty - 9999) >= .005 -- Ignore default value cases where ProductCostDTP is a multiple of 9999
+  GROUP BY 1,2,3
+) wsc ON hed.PrSKU = wsc.PrSKU AND mon.Datum = wsc.Datum
+ORDER BY 2,3,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.5.0: Historical page views and visits. Time frame: Last 7 months dating back from today. Cadence: Monthly
+
+/*
+1. `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits_product_views` could be used where COUNT(DISTINCT Event_SessionKey) -
+will give a count of visits that saw at least one product and SUM(TotalClicks) represents how many total page views the visit had for the given SKU
+
+2. Alternatively joining `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits` on `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_clicks_product_request` - 
+yields similar results. The equivalent aggregating functions would be COUNT(DISTINCT Event_SessionKey) and SUM(1)
+
+We choose to work with option 1 here
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_views_and_visits_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_views_and_visits_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  COALESCE(x.Distinct_Visits, 0) AS Agg_Monthly_Distinct_Visits,
+  COALESCE(x.Total_PageViews, 0) AS Agg_Monthly_PageViews 
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+LEFT JOIN (
+  SELECT
+    DATE_TRUNC(v.SessionStartDate, MONTH) AS Datum,
+    v.Event_SoID,
+    v.Event_PrSKU, 
+    COUNT(DISTINCT v.Event_SessionKey) AS Distinct_Visits,
+    SUM(v.TotalClicks) AS Total_PageViews
+  FROM `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits_product_views` v
+  JOIN `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits_exclusion_reason` ex 
+    ON 1=1
+    AND ex.SessionStartDate = v.SessionStartDate
+    AND ex.Event_SoID = v.Event_SoID
+    AND ex.Event_SessionKey = v.Event_SessionKey
+  WHERE 1=1
+    AND v.Event_SoID = 368 -- 321 for UK; 368 for DE
+    AND v.Event_PrSKU IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Includes the anchor SKUs and NNs
+    AND v.SessionStartDate >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'SessionStartDate' timeline from the first day of the month 7 months ago
+    AND ex.VisitExclusionreason = 0 -- That's a standard filter to get the right number of visits and views
+    AND v.Event_PrSKU IS NOT NULL -- That's a standard filter to get the right number of visits and views
+  GROUP BY 1,2,3
+  ORDER BY 2,3,1
+) x ON x.Datum = mon.Datum AND x.Event_PrSKU = hed.PrSKU;
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.6.0: Historical attribute driving tag coverage trend. Time frame: Last 7 months dating back from today. Cadence: Monthly
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_ad_tag_coverage_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_ad_tag_coverage_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  x.AvgADTagCoverage
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+LEFT JOIN (
+  SELECT 
+    DATE_TRUNC(snapshotdate, MONTH) AS Datum,
+    bclgid,
+    SoID,
+    prsku,
+    AVG(ADTagCoverage) AS AvgADTagCoverage -- Aggregate the AD tag coverage on SKU-month level by averaging the daily values across every month starting from t-7 months ago 
+  FROM (
+    SELECT -- This sub-query gets the attribute driving tag coverage on SKU level per DAY
+      snapshotdate,
+      bclgid,
+      CASE WHEN bclgid = 2 THEN 321 WHEN bclgid = 3 THEN 368 ELSE NULL END AS SoID,
+      prsku,
+      adtagcoveragenumerator / NULLIF(adtagcoveragedenominator,0) AS ADTagCoverage
+    FROM `wf-gcp-us-ae-merch-prod.analytics_merch_processing.tbl_bic_merch_product_information_sku`
+    WHERE 1=1
+      AND bclgid = 3 -- Filter for the Geo ID that belongs to the chosen class
+      AND prsku IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Includes the anchor SKUs and NNs
+      AND snapshotdate >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'SessionStartDate' timeline from the first day of the month 7 months ago
+  )
+  GROUP BY 1,2,3,4
+) x ON x.Datum = mon.Datum AND x.prsku = hed.PrSKU 
+ORDER BY 2,3,1;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.7.0: Historical TTD estimates on SKU level. Time frame: Last 7 months dating back from today. Cadence: Monthly
+/*
+- We use the lead time recommended by liteship when a customer lands on a page as our source for TTD
+- We calculate TTD estimates on SKU level, but replace them with supplier-class level estimates if SKU-level data is not available
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_ttd_est_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_ttd_est_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  COALESCE(sku.Avg_Monthly_TTD_Est_SKU, sup.Avg_Monthly_TTD_Est_Su_Cl) AS Avg_Monthly_TTD_Est, -- Get TTD data on SKU or Su-class level depending on what is available
+  CASE 
+    WHEN sku.Avg_Monthly_TTD_Est_SKU IS NOT NULL THEN 'SKU Level TTD Est'
+    WHEN sup.Avg_Monthly_TTD_Est_Su_Cl IS NOT NULL THEN 'Supplier-Class Level TTD Est'
+  ELSE NULL
+  END AS TTDEstimateDesignation
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+
+LEFT JOIN ( -- TTD estimates on SKU level (will contain missing data, so we supplement with supplier-class level estimates where appropriate)
+  SELECT 
+    DATE_TRUNC(v.SessionStartDate, MONTH) AS Datum,
+    v.Event_SoID,
+    p.Event_PrSKU,
+    ROUND(AVG(DATE_DIFF(CAST(p.DeliveryEstimate AS DATE), v.SessionStartDate, DAY)), 1) AS Avg_Monthly_TTD_Est_SKU -- Calculate the average monthly TTD estimate on SKU level
+  FROM `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits` v 
+  INNER JOIN `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_clicks_product_request` p
+    ON 1=1 
+      AND p.SessionStartDate = v.SessionStartDate
+      AND p.Event_SoID = v.Event_SoID
+      AND p.Event_SessionKey = v.Event_SessionKey
+  INNER JOIN `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits_exclusion_reason` ex
+    ON 1=1
+      AND ex.SessionStartDate = v.SessionStartDate 
+      AND ex.Event_SoID = v.Event_SoID
+      AND ex.Event_SessionKey = v.Event_SessionKey
+  WHERE 1=1
+      AND v.Event_SoID = 368 -- 321 for UK; 368 for DE
+      AND p.Event_PrSKU IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Filter for PDP views that have SKUs contained in the "cm_fp_hedwig_skus_de_catalog" list
+      AND v.SessionStartDate >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'SessionStartDate' timeline from the first day of the month 7 months ago
+      AND ex.VisitExclusionreason = 0 -- That's a standard filter to get the right number of visits and views
+      AND p.Event_PrSKU IS NOT NULL -- That's a standard filter to get the right number of visits and views
+      AND p.DeliveryEstimate > p.SessionStartDate -- Sometimes, the delivery estimate field is empty. Use this to eliminate non-meaningful records
+  GROUP BY 1,2,3
+  ORDER BY 2,3,1
+) sku ON sku.Datum = mon.Datum AND sku.Event_PrSKU = hed.PrSKU
+
+INNER JOIN (
+/*
+This INNER JOIN connects to the master list of SKUs generated by the CROSS JOIN and maps the SKUs contained in the "cm_fp_hedwig_skus_de_catalog" to their SUs, class, and Mkc. We force the mapping to always be 1-to-1. In other words, each SKU will have 1 supplier, 1 class, and 1 Mkc
+*/
+  SELECT *
+  FROM (
+    SELECT DISTINCT 
+        a.*, 
+        ppr.SupplierID AS SuID, 
+        ppr.SupplierName, 
+        jpc.ClID, 
+        cl.ClName, 
+        mkc.MkcID, 
+        mkc.MkcName, 
+        ROW_NUMBER() OVER (PARTITION BY mkc.MkcID, jpc.ClID, a.PrSKU ORDER BY SUM(GRS12M) DESC) AS Precedence, -- Used to pick the supplier with highest 12-month GRS
+        SUM(GRS12M) AS GRS12M
+      FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` a
+      LEFT JOIN `wf-gcp-us-ae-pricing-prod.profit_mgmt.tbl_product_price_report` ppr ON a.PrSKU = ppr.PrSKU AND ppr.BclgID = 3 -- Connect the SKU to its supplier(s). Join on the geo ID specified in the inputs section above
+      LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_join_product_class` jpc ON a.PrSKU = jpc.PrSKU AND PcMasterClass = TRUE -- Connect SKU to a *globally recognized* class
+      LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_class` cl ON jpc.ClID = cl.ClID -- Connect ClID to class name
+      LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_marketing_category` mkc ON mkc.MkcID = cl.ClMkcID -- Connect class to category
+      GROUP BY 1,2,3,4,5,6,7
+    )
+  WHERE Precedence = 1 -- Multiple matches can arise from multiple suppliers being mapped to the same SKU. This ensures that we only choose the supplier with the highest revenue such that we always have a 1-to-1 mapping from SKU to supplier
+  ORDER BY 1,3
+) map ON map.PrSKU = hed.PrSKU -- No need to join on Store ID or BclgID because this sub-query is already filtered for the geo ID specified above thru the 1st LEFT JOIN
+
+LEFT JOIN ( -- TTD estimates on supplier-class level (will replace missing data on SKU level)
+  SELECT
+    DATE_TRUNC(v.SessionStartDate, MONTH) AS Datum,
+    v.Event_SoID,
+    COALESCE(su.SuParentSuID, su.SuID) AS ParentSuID, -- You must COALESCE these two columns in tblSupplier because the SuID column contains both parent and child supplier IDs 
+    su2.SuName AS SuName_Parent,
+    jpc.ClID,
+    ROUND(AVG(DATE_DIFF(CAST(p.DeliveryEstimate AS DATE), v.SessionStartDate, DAY)), 1) AS Avg_Monthly_TTD_Est_Su_Cl -- Calculate the average monthly TTD estimate on supplier-class level
+  FROM `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits` v 
+  INNER JOIN `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_clicks_product_request` p
+    ON 1=1 
+      AND p.SessionStartDate = v.SessionStartDate
+      AND p.Event_SoID = v.Event_SoID
+      AND p.Event_SessionKey = v.Event_SessionKey
+  INNER JOIN `wf-gcp-us-ae-sf-prod.curated_clickstream.tbl_dash_visits_exclusion_reason` ex
+    ON 1=1
+      AND ex.SessionStartDate = v.SessionStartDate 
+      AND ex.Event_SoID = v.Event_SoID
+      AND ex.Event_SessionKey = v.Event_SessionKey
+  INNER JOIN `wf-gcp-us-ae-bulk-prod.csn_order.tblSupplier` su ON su.SuID = p.LeadTimeSupplierID -- LeadTimeSupplierID is the SuID of the fulfilling supplier. We do this join to get the parent SuID
+  INNER JOIN `wf-gcp-us-ae-bulk-prod.csn_order.tblSupplier` su2 ON su2.SuID = COALESCE(su.SuParentSuID, su.SuID) -- We do this join to get the parent supplier's name
+  INNER JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_join_product_class` jpc ON p.Event_PrSKU = jpc.PrSKU AND PcMasterClass = TRUE -- Connect SKUs to their master classes
+  WHERE 1=1
+    AND v.Event_SoID = 368 -- 321 for UK; 368 for DE
+    AND v.SessionStartDate >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'SessionStartDate' timeline from the first day of the month 7 months ago
+    AND ex.VisitExclusionreason = 0 -- That's a standard filter to get the right number of visits and views
+    AND p.Event_PrSKU IS NOT NULL -- That's a standard filter to get the right number of visits and views
+    AND p.DeliveryEstimate > p.SessionStartDate -- Sometimes, the delivery estimate field is empty. Use this to eliminate non-meaningful records
+  GROUP BY 1,2,3,4,5
+  ORDER BY 2,5,4,1
+) sup ON map.SuID = sup.ParentSuID AND sup.Datum = mon.Datum AND map.ClID = sup.ClID
+
+ORDER BY 2,3,1;
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+/* 
+Step 2.8.0: Historical RPI on SKU level. Time frame: Last 7 months dating back from today. Cadence: Monthly
+Chosen competitors are the tier-1 competitors in UK and DE (specified in the inputs section above)
+If a SKU has more than one match, the lowest-in-market is chosen. Missing RPI values on SKU level are NOT imputed and left as NULL
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_rpi_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_rpi_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  x.LiMCompetitor AS LiMCompetitor_hist,
+  x.RPI0_LiM AS RPI0_hist,
+  x.RPI28_LiM AS RPI28_hist,
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+
+LEFT JOIN ( -- This is the sub-query that gets you the actual RPI values on SKU level per month. If a SKU has multiple matches, the competitor with the lowest RPI will be chosen
+  SELECT 
+    soid,
+    Datum,
+    prsku,
+    ARRAY_AGG(competitorname ORDER BY RPI0 LIMIT 1)[OFFSET (0)] AS LiMCompetitor, -- Choosing the competitor witht the lowest RPI
+    MIN(RPI0) AS RPI0_LiM,
+    MIN(RPI28) AS RPI28_LiM
+  FROM ( 
+    SELECT 
+      a.soid,
+      DATE_TRUNC(InsertDate, MONTH) AS Datum,
+      a.prsku,
+      com.competitorname,
+      SUM(RPI0D_Numerator) / SUM(RPI0D_Denominator) AS RPI0,
+      SUM(RPI28D_Numerator) / SUM(RPI28D_Denominator) AS RPI28
+    FROM `wf-gcp-us-ae-pricing-prod.pricing_dw.tbl_fact_pc_opc_rpi_sku` AS a -- Table containing RPI data on SKU level
+    JOIN `wf-gcp-us-ae-pricing-prod.pricing_dw.tbl_dim_pc_opc_competitor` AS com ON com.CompetitorID = a.CompetitorID -- Table linking competitor name and competitor ID
+    WHERE 1=1 
+      AND a.soid = 368
+      AND CompetitorName IN ('Amazon Buy Box', 'otto', 'kaufland', 'home24', 'reuter') -- ('Amazon Buy Box', 'ebayuk', 'argos', 'JohnLewis', 'heatandplumb') in the UK and ('Amazon Buy Box', 'otto', 'kaufland', 'home24', 'reuter') in DE
+      AND InsertDate >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH)
+      AND a.prsku IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Filter for the SKUs contained in the "cm_fp_hedwig_skus_de_catalog" list
+    GROUP BY 1,2,3,4
+    ORDER BY 1,3,2
+  )
+  GROUP BY 1,2,3
+  ORDER BY 1,3,2
+) x ON x.Datum = mon.Datum AND x.prsku = hed.PrSKU
+
+ORDER BY 2,3,1;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.9.0: Historical OOS on SKU level. Time frame: Last 7 months dating back from today. Cadence: Monthly
+
+/*
+As a 1st step, we calculate the OOS frequency for all MpID-Parent SuID combinations PER day, and take the MIN frequency PER MpID across all suppliers. Here, we assume that as long as the MpID can be fulfilled by any supplier, then the OOS frequency of that MpID-supplier combination is the most representative figure for the OOS frequency on MpID level
+
+Next, we average the OOS frequencies across MpIDs to arrive at a single blended OOS frequency on SKU level (or SKU-month level if we are pulling historical OOS). 
+
+This means that we do **NOT** assume the entire SKU to be fulfillable if at least one MpID can get delivered to the customer. 
+
+We actually want to capture the OOS of individual MpIDs in that blended OOS figure on SKU level/SKU-month level. 
+
+The number that we end up with would represent how often were we able to NOT fulfill ANY orders of that SKU to the customer
+
+-------------------------------------------------------------------
+
+The result of the 1st step is *daily OOS frequencies* on MpID level
+
+For the 2nd step, we average the resulting OOS frequencies on SKU level to arrive at one OOS value for every SKU PER day
+
+For the 3rd step, we average the daily OOS frequencies on SKU level over 30-day periods covering the 7 months dating back from today to arrive at one OOS value for every SKU-month combination.
+
+If we are calculating status-quo OOS frequencies, we average the daily OOS frequencies on SKU level over the last 30 days ONLY
+
+Note: Some SKUs will have NULL OOS frequencies
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_oos_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_oos_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+  mon.Datum,
+  368 AS SoID,
+  hed.PrSKU,
+  AvgOOSFreqPct_SKU AS AvgOOSFreqPct_SKU_Hist
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog` hed -- Includes the anchor SKUs and NNs
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+LEFT JOIN (
+  SELECT -- Query 3: Calculate the average *monthly* OOS frequencies on SKU level 
+    DATE_TRUNC(EffectiveDate, MONTH) AS Datum,
+    BclgID,
+    SoID,
+    PrSKU,
+    ROUND(AVG(AvgOOSFreqPct_AcrossMpIDs), 2) AS AvgOOSFreqPct_SKU -- Avg monthly OOS frequency covering the 7 months dating back from today (refer to step 3 above)
+  FROM (
+    SELECT -- Query 2: Calculate the average OOS frequency across all MpIDs so that we get a single OOS frequency for each SKU every day. In this step, we handle the multiple MpIDs issue
+      BclgID,
+      SoID,
+      EffectiveDate, 
+      PrSKU,
+      AVG(MinOOSFreqPct_AcrossSuppliers) AS AvgOOSFreqPct_AcrossMpIDs, -- We take the average OOS frequency across all MpIDs per day as outlined above (refer to step 2)
+    FROM (
+      SELECT -- Query 1: Get the minimum OOS frequency on MpID level across all suppliers. For a single SKU, there can be multiple MpIDs AND suppliers linked to it. In this step, we handle the multiple suppliers issue ONLY
+        ppr.BclgID,
+        CASE WHEN ppr.BclgID = 2 THEN 321 WHEN ppr.BclgID = 3 THEN 368 ELSE NULL END AS SoID,
+        oos.EffectiveDate, 
+        ppr.PrSKU,
+        oos.ManufacturerPartID,
+        -- This is the MIN daily OOS frequency on MpID level across all possible SUs (refer to step 1 above). We divide by 24 because the OOSDuration_Calculated column is expressed in hrs and one full day has 24 hours
+        MIN(oos.OOSDuration_Calculated/24) AS MinOOSFreqPct_AcrossSuppliers,
+      FROM `wf-gcp-us-ae-ops-prod.csn_whs_reporting.tbl_agg_oos_findable` oos
+      LEFT JOIN `wf-gcp-us-ae-pricing-prod.profit_mgmt.tbl_product_price_report` ppr ON oos.ManufacturerPartId = ppr.ManufacturerPartID AND CASE WHEN ppr.BclgID = 2 THEN 233 WHEN ppr.BclgID = 3 THEN 82 END = 82 -- Assumption: MpID-to-SKU mapping is constant
+      WHERE 1=1
+        AND ppr.PrSKU IN (SELECT PrSKU FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_skus_de_catalog`) -- Filter for the SKUs contained in the "cm_fp_hedwig_skus_de_catalog" list
+        AND EffectiveDate >= DATE_TRUNC(DATE_ADD(CURRENT_DATE(), INTERVAL -7 MONTH), MONTH) -- Begin the 'SessionStartDate' timeline from the first day of the month 7 months ago
+        AND CustomerCountryID = 82
+        AND ppr.BclgID = 3
+      GROUP BY 1,2,3,4,5
+      ORDER BY 4,5,3
+    )
+    WHERE PrSKU IS NOT NULL -- All MpIDs MUST be mapped to a SKU. If the mapping doesn't exist for a specific MpID, drop the OOS record for that MpID
+    GROUP BY 1,2,3,4
+    ORDER BY 1,4,3
+  )
+  GROUP BY 1,2,3,4
+  ORDER BY 2,4,1
+) x ON x.Datum = mon.Datum AND x.PrSKU = hed.PrSKU 
+ORDER BY 2,3,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 2.10: Consolidating historical metrics together in one table
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_all_metrics_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_all_metrics_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT
+  -- Grouping variables
+  vv.Datum,
+  vv.SoID,
+  vv.PrSKU,
+
+  -- GRS and TOC
+  biz.Agg_Monthly_GRS AS GRS_hist,
+  biz.Agg_Monthly_TOC AS TOC_hist,
+  
+  -- Distinct visits, page views, and conversion rate
+  vv.Agg_Monthly_Distinct_Visits AS Distinct_Visits_hist,
+  vv.Agg_Monthly_PageViews AS PageViews_hist,
+  COALESCE(biz.Agg_Monthly_TOC / NULLIF(vv.Agg_Monthly_Distinct_Visits,0),0) AS ConversionRate_hist,
+  
+  -- Additional metrics: AD tag coverage, lead time, RPI, and OOS
+  tag.AvgADTagCoverage AS ADTagCoverage_hist,
+  
+  ttd.Avg_Monthly_TTD_Est AS Leadtime_Est_hist,
+  ttd.TTDEstimateDesignation AS Leadtime_Est_Granularity_hist,
+  
+  rpi.RPI0_hist,
+  rpi.RPI28_hist,
+  rpi.LiMCompetitor_hist,
+  
+  oos.AvgOOSFreqPct_SKU_Hist AS OOSFreqPct_hist,
+  
+  -- RevW WSC and COGS
+  cogs.RevW_WSC_hist,
+  cogs.RevW_WSC_hist_LandedvsPIT_Flag,
+  cogs.RevW_WSC_hist_RevWvsAvg_Flag,
+  
+  cogs.RevW_RAR_hist,
+  cogs.RevW_RAR_hist_LandedvsPIT_Flag,
+  cogs.RevW_RAR_hist_RevWvsAvg_Flag,
+  
+  cogs.RevW_IncRatio_hist,
+  cogs.RevW_IncRatio_hist_LandedvsPIT_Flag,
+  cogs.RevW_IncRatio_hist_RevWvsAvg_Flag,
+  
+  cogs.RevW_SCCOGS_hist,
+  cogs.RevW_SCCOGS_hist_LandedvsPIT_Flag,
+  cogs.RevW_SCCOGS_hist_RevWvsAvg_Flag,
+  
+  cogs.RevW_Inc_And_SC_ShareOfCOGS_hist,
+  cogs.RevW_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+  cogs.RevW_Inc_And_SC_ShareOfCOGS_hist_RevWvsAvg_Flag,
+  
+  -- Avg WSC and COGS
+  cogs.Avg_WSC_hist,
+  cogs.Avg_WSC_hist_LandedvsPIT_Flag, -- The "RevW flag" and "Avg flag" are equal for the same SKU-month combination
+  
+  cogs.Avg_RAR_hist,
+  cogs.Avg_RAR_hist_LandedvsPIT_Flag,
+  
+  cogs.Avg_IncRatio_hist,
+  cogs.Avg_IncRatio_hist_LandedvsPIT_Flag,
+  
+  cogs.Avg_SCCOGS_hist,
+  cogs.Avg_SCCOGS_hist_LandedvsPIT_Flag,
+  
+  cogs.Avg_Inc_And_SC_ShareOfCOGS_hist,
+  cogs.Avg_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+  
+  -- Median WSC and COGS
+  Median_WSC_hist,
+  Median_WSC_hist_LandedvsPIT_Flag,
+
+  cogs.Median_RAR_hist,
+  cogs.Median_RAR_hist_LandedvsPIT_Flag,
+  
+  cogs.Median_IncRatio_hist,
+  cogs.Median_IncRatio_hist_LandedvsPIT_Flag,
+  
+  cogs.Median_SCCOGS_hist,
+  cogs.Median_SCCOGS_hist_LandedvsPIT_Flag,
+  
+  cogs.Median_Inc_And_SC_ShareOfCOGS_hist,
+  cogs.Median_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+  
+  CURRENT_TIMESTAMP() AS DataPullTimeStamp
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_views_and_visits_de_catalog` vv
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_cogs_all_de_catalog` cogs ON vv.Datum = cogs.Datum AND vv.SoID = cogs.SoID AND vv.PrSKU = cogs.PrSKU
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_grs_orders_de_catalog` biz ON vv.Datum = biz.Datum AND vv.SoID = biz.SoID AND vv.PrSKU = biz.PrSKU
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_ad_tag_coverage_de_catalog` tag ON vv.Datum = tag.Datum AND vv.SoID = tag.SoID AND vv.PrSKU = tag.PrSKU
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_ttd_est_de_catalog` ttd ON vv.Datum = ttd.Datum AND vv.SoID = ttd.SoID AND vv.PrSKU = ttd.PrSKU
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_rpi_de_catalog` rpi ON vv.Datum = rpi.Datum AND vv.SoID = rpi.SoID AND vv.PrSKU = rpi.PrSKU
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_oos_de_catalog` oos ON vv.Datum = oos.Datum AND vv.SoID = oos.SoID AND vv.PrSKU = oos.PrSKU
+ORDER BY 2,3,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 3.3: Joining the markets to the *historical* business metrics and calculating ranks and percentile ranks
+
+-- This table includes all anchors, NNs, *historical* business metrics, as well as ranks and rank percentiles
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_all_benchmarks_anchors_plus_nn_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_all_benchmarks_anchors_plus_nn_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT
+  -- Grouping variables
+  mon.Datum,
+  hsc.SoID,
+  hsc.MkcID,
+  hsc.ClID,
+  hsc.ParentSuID_AnchorSKU,
+  hsc.ParentSuID_NNs,
+  hsc.Anchor_SKU,
+  hsc.NNs,
+  hsc.NN_rank,
+  
+  -- WSC and COGS
+  hmet.Median_WSC_hist,
+  hmet.Median_WSC_hist_LandedvsPIT_Flag AS WSC_hist_LandedvsPIT_Flag, -- Only one of "RevW_WSC_hist_LandedvsPIT_Flag", "Median_WSC_hist_LandedvsPIT_Flag", or "Avg_WSC_hist_LandedvsPIT_Flag" suffice because they are all the same
+  
+  ROUND(hmet.Median_RAR_hist, 4) AS Median_RAR_hist,
+  hmet.Median_RAR_hist_LandedvsPIT_Flag AS RAR_hist_LandedvsPIT_Flag,
+  
+  ROUND(hmet.Median_IncRatio_hist, 4) AS Median_IncRatio_hist,
+  hmet.Median_IncRatio_hist_LandedvsPIT_Flag AS IncRatio_hist_LandedvsPIT_Flag,
+  
+  ROUND(hmet.Median_SCCOGS_hist, 4) AS Median_SCCOGS_hist,
+  hmet.Median_SCCOGS_hist_LandedvsPIT_Flag AS SCCOGS_hist_LandedvsPIT_Flag,
+  
+  ROUND(hmet.Median_Inc_And_SC_ShareOfCOGS_hist, 4) AS Median_Inc_And_SC_ShareOfCOGS_hist,
+  hmet.Median_Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag AS Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+  
+  -- Commercial metrics (Aggregated over the last 30 days)
+  ROUND(hmet.GRS_hist, 2) AS GRS_Monthly_Agg,
+  hmet.TOC_hist AS TOC_Monthly_Agg,
+  hmet.Distinct_Visits_hist AS Visits_Monthly_Agg,
+  hmet.PageViews_hist AS PV_Monthly_Agg,
+  ROUND(hmet.ConversionRate_hist, 4) AS CR_Monthly_Avg,
+  
+  -- Additional metrics: AD Tag coverage (Merch), Leadtime (TTD), RPI (competitiveness), OOS (Inventory levels) - Aggregated over the last 30 days
+  ROUND(hmet.ADTagCoverage_hist, 3) AS ADTagCoverage_Monthly_Avg,
+  
+  hmet.Leadtime_Est_hist AS Leadtime_Est_Monthly_Avg, -- The estimate is in days
+  hmet.Leadtime_Est_Granularity_hist, -- Indicates whether the estimate is on SKU or supplier-class level
+  
+  ROUND(hmet.RPI0_hist, 4) AS RPI0_Monthly_Avg,
+  ROUND(hmet.RPI28_hist, 4) AS RPI28_Monthly_Avg,
+  hmet.LiMCompetitor_hist,
+  
+  hmet.OOSFreqPct_hist AS OOSFreqPct_Monthly_Avg,
+  
+  -- In all the code statements below, we drop missing values when calculating ranks and percentile ranks. This is syntactically achieved by the CASE-WHEN command
+  
+  -- WSC: The lower, the better
+  CASE WHEN hmet.Median_WSC_hist IS NOT NULL AND NN_rank < 11
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_WSC_hist IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN NN_rank < 11 THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_WSC_hist
+  ) END AS Median_WSC_Hist_Rank, -- This calculates the rank of the anchor based on itself + its top 10 NNs ONLY
+  
+  CASE WHEN hmet.Median_WSC_hist IS NOT NULL AND NN_rank < 11
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_WSC_hist IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN NN_rank < 11 THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_WSC_hist
+  ), 2) END AS Median_WSC_Hist_PctRank, -- This calculates the percentile rank of the anchor based on itself + its top 10 NNs ONLY
+
+  -- RAR: The higher, the better
+  CASE WHEN hmet.Median_RAR_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_RAR_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_RAR_hist DESC
+  ) END AS RAR_Hist_Rank, -- This calculates the rank of the anchor based on itself + its top 100 NNs
+  
+  CASE WHEN hmet.Median_RAR_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_RAR_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_RAR_hist
+  ), 2) END AS RAR_Hist_PctRank, -- This calculates the percentile rank of the anchor based on itself + its top 100 NNs
+
+  -- IncRatio: The lower, the better
+  CASE WHEN hmet.Median_IncRatio_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_IncRatio_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_IncRatio_hist
+  ) END AS IncRatio_Hist_Rank,
+  
+  CASE WHEN hmet.Median_IncRatio_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_IncRatio_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_IncRatio_hist
+  ), 2) END AS IncRatio_Hist_PctRank,
+
+  -- SCCOGS: The lower, the better
+  CASE WHEN hmet.Median_SCCOGS_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_SCCOGS_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_SCCOGS_hist
+  ) END AS SCCOGS_Hist_Rank,
+  
+  CASE WHEN hmet.Median_SCCOGS_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_SCCOGS_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_SCCOGS_hist
+  ), 2) END AS SCCOGS_Hist_PctRank, 
+
+  -- Inc_And_SC_ShareOfCOGS: The lower, the better
+  CASE WHEN hmet.Median_Inc_And_SC_ShareOfCOGS_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_Inc_And_SC_ShareOfCOGS_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_Inc_And_SC_ShareOfCOGS_hist
+  ) END AS Inc_And_SC_ShareOfCOGS_Hist_Rank,
+  
+  CASE WHEN hmet.Median_Inc_And_SC_ShareOfCOGS_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Median_Inc_And_SC_ShareOfCOGS_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Median_Inc_And_SC_ShareOfCOGS_hist
+  ), 2) END AS Inc_And_SC_ShareOfCOGS_Hist_PctRank,
+
+  -- GRS: The higher, the better
+  CASE WHEN hmet.GRS_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.GRS_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.GRS_hist DESC
+  ) END AS GRS_Hist_Rank,
+  
+  CASE WHEN hmet.GRS_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.GRS_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.GRS_hist
+  ), 2) END AS GRS_Hist_PctRank, 
+
+  -- Total Order Count: The higher, the better
+  CASE WHEN hmet.TOC_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.TOC_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.TOC_hist DESC
+  ) END AS TOC_Hist_Rank,
+  
+  CASE WHEN hmet.TOC_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.TOC_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.TOC_hist
+  ), 2) END AS TOC_Hist_PctRank,  
+
+  -- Distinct SKU Visits: The higher, the better
+  CASE WHEN hmet.Distinct_Visits_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Distinct_Visits_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Distinct_Visits_hist DESC
+  ) END AS Visits_Hist_Rank,
+  
+  CASE WHEN hmet.Distinct_Visits_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Distinct_Visits_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Distinct_Visits_hist
+  ), 2) END AS Visits_Hist_PctRank,
+
+  -- Page Views: The higher, the better
+  CASE WHEN hmet.PageViews_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.PageViews_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.PageViews_hist DESC
+  ) END AS PV_Hist_Rank,
+  
+  CASE WHEN hmet.PageViews_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.PageViews_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.PageViews_hist
+  ), 2) END AS PV_Hist_PctRank,
+
+  -- Conversion Rate: The higher, the better
+  CASE WHEN hmet.ConversionRate_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.ConversionRate_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.ConversionRate_hist DESC
+  ) END AS CR_Hist_Rank,
+  
+  CASE WHEN hmet.ConversionRate_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.ConversionRate_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.ConversionRate_hist
+  ), 2) END AS CR_Hist_PctRank,
+  
+  -- AD Tag coverage: The higher, the better
+  CASE WHEN hmet.ADTagCoverage_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.ADTagCoverage_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.ADTagCoverage_hist DESC
+  ) END AS ADTagCoverage_Hist_Rank,
+  
+  CASE WHEN hmet.ADTagCoverage_hist IS NOT NULL
+  THEN ROUND(1 - PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.ADTagCoverage_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.ADTagCoverage_hist
+  ), 2) END AS ADTagCoverage_Hist_PctRank,
+  
+  -- Leadtime Estimate: The lower, the better
+  CASE WHEN hmet.Leadtime_Est_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Leadtime_Est_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Leadtime_Est_hist
+  ) END AS Leadtime_Est_Hist_Rank,
+  
+  CASE WHEN hmet.Leadtime_Est_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.Leadtime_Est_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.Leadtime_Est_hist
+  ), 2) END AS Leadtime_Est_Hist_PctRank,
+  
+  -- RPI0 and RPI28: The lower, the better
+  CASE WHEN hmet.RPI0_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.RPI0_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.RPI0_hist
+  ) END AS RPI0_Hist_Rank,
+  
+  CASE WHEN hmet.RPI0_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.RPI0_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.RPI0_hist
+  ), 2) END AS RPI0_Hist_PctRank,
+  
+  CASE WHEN hmet.RPI28_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.RPI28_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.RPI28_hist
+  ) END AS RPI28_Hist_Rank,
+  
+  CASE WHEN hmet.RPI28_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.RPI28_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.RPI28_hist
+  ), 2) END AS RPI28_Hist_PctRank,
+  
+  -- OOS: The lower, the better
+  CASE WHEN hmet.OOSFreqPct_hist IS NOT NULL
+  THEN DENSE_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum, CASE WHEN hmet.OOSFreqPct_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.OOSFreqPct_hist
+  ) END AS OOS_Hist_Rank,
+  
+  CASE WHEN hmet.OOSFreqPct_hist IS NOT NULL
+  THEN ROUND(PERCENT_RANK() OVER (
+    PARTITION BY hsc.SoID, hsc.MkcID, hsc.ClID, Anchor_SKU, mon.Datum,  CASE WHEN hmet.OOSFreqPct_hist IS NOT NULL THEN 1 ELSE 0 END
+    ORDER BY hmet.OOSFreqPct_hist
+  ), 2) END AS OOS_Hist_PctRank,
+  
+  hmet.DataPullTimeStamp
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_parsed_chng_de_catalog` hsc
+/* 
+This cross join produces 8 rows (because we go back 7 months in time and also include the current month)
+Each row containing a date corresponding to a certain month (e.g. 2021-01-01, 2021-02-01, 2021-03-01). The format is YYYY-mm-dd
+*/
+CROSS JOIN (SELECT DATE_TRUNC(Month_Array, MONTH) AS Datum FROM UNNEST(GENERATE_DATE_ARRAY(DATE_ADD(CURRENT_DATE, INTERVAL -7 MONTH), CURRENT_DATE(), INTERVAL 1 MONTH)) AS Month_Array) mon
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_all_metrics_de_catalog` hmet ON mon.Datum = hmet.Datum AND hsc.SoID = hmet.SoID AND hsc.NNs = hmet.PrSKU
+--WHERE mon.Datum BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 4 MONTH) AND CURRENT_DATE() -- **VERY IMPORTANT FILTER - ONLY USE WHEN VIEWING DATA ON A WEEKLY BASIS**: Only display data for the most recent 4 months instead of 7 months. Otherwise, the table and running time explode
+ORDER BY 2,3,4,7,1,9;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 4.2: Curating the final table of *historical* metrics and benchmarks that is going to be provided to CMs (anchors only)
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT
+  -- Grouping variables
+  hist.Datum,
+  hist.SoID AS Store_ID,
+  CASE WHEN hist.SoID = 321 THEN 'UK' WHEN hist.SoID = 368 THEN 'DE' END AS BclgID,
+  hist.MkcID AS Category_ID,
+  mkc.MkcName AS Category_Name,
+  hist.ClID AS Class_ID,
+  cl.ClName AS Class_Name,
+  CASE WHEN des.ClDesignation IS NULL THEN 'Differentiated Class' ELSE 'Branded Class' END AS Class_Designation,
+  ParentSuID_AnchorSKU AS Supplier_ID,
+  Anchor_SKU AS SKU,
+  Top_10_Nearest_Neighbors,
+  
+  -- WSC and COGS
+  Median_WSC_hist AS Wholesale_Cost_Absolute,
+  WSC_hist_LandedvsPIT_Flag AS WSC_LandedvsPIT_Flag,
+  Median_RAR_hist AS Post_Order_Costs_Absolute,
+  RAR_hist_LandedvsPIT_Flag AS Post_Order_Costs_LandedvsPIT_Flag,
+  Median_Inc_And_SC_ShareOfCOGS_hist AS Shipcosts_And_Incidences_Absolute,
+  Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag AS Shipcosts_And_Incidences_LandedvsPIT_Flag,
+  Median_SCCOGS_hist AS Shipcosts_Absolute,
+  SCCOGS_hist_LandedvsPIT_Flag AS Shipcosts_LandedvsPIT_Flag,
+  
+  -- Ops & Merch: AD Tag coverage (Merch), Leadtime (TTD), RPI (competitiveness), OOS (Inventory levels)
+  Leadtime_Est_Monthly_Avg AS Order_Delivery_Time_Absolute, -- The estimate is in days
+  Leadtime_Est_Granularity_hist AS Order_Delivery_Time_Granularity, -- Indicates whether the estimate is on SKU or supplier-class level 
+  OOSFreqPct_Monthly_Avg AS Out_Of_Stock_Absolute,
+  ADTagCoverage_Monthly_Avg AS Merchandising_Absolute,
+  -- Deleted RPI0_Monthly_Avg as it's the same as RPI28_Monthly_Avg on SKU level
+  RPI28_Monthly_Avg AS RPI_Absolute,
+  LiMCompetitor_hist AS LiMCompetitor_hist,
+  
+  -- Output Commercial Metrics
+  GRS_Monthly_Agg AS Revenue_Absolute,
+  wsc.WSC_Revenue,
+  CR_Monthly_Avg AS Conversion_Rate_Absolute,
+  Visits_Monthly_Agg AS Visits_Absolute,
+  
+  -- Percentile ranks
+  Median_WSC_Hist_PctRank AS Wholesale_Cost,
+  RAR_Hist_PctRank AS Post_Order_Costs,
+  Inc_And_SC_ShareOfCOGS_Hist_PctRank AS Shipcosts_And_Incidences,
+  SCCOGS_Hist_PctRank AS Shipcosts,
+  
+  Leadtime_Est_Hist_PctRank AS Order_Delivery_Time,
+  OOS_Hist_PctRank AS Out_Of_Stock,
+  ADTagCoverage_Hist_PctRank AS Merchandising,
+  RPI28_Hist_PctRank AS RPI,
+  
+  GRS_Hist_PctRank AS Revenue,
+  Visits_Hist_PctRank AS Visits,
+  CR_Hist_PctRank AS Conversion_Rate,
+
+  hist.DataPullTimeStamp
+FROM ( -- Sub-query used to prepare the fields for the SELECT statement above - Here, we add new fields showing the color code corresponding to the percentile ranks to help with the CASE-WHEN statements above
+  SELECT
+    Datum,
+    SoID,
+    MkcID,
+    ClID,
+    ParentSuID_AnchorSKU,
+    ben.Anchor_SKU,
+    nn.Top_10_Nearest_Neighbors,
+    
+    -- WSC and COGS
+    Median_WSC_hist,
+    WSC_hist_LandedvsPIT_Flag,
+    Median_RAR_hist,
+    RAR_hist_LandedvsPIT_Flag,
+    Median_Inc_And_SC_ShareOfCOGS_hist,
+    Inc_And_SC_ShareOfCOGS_hist_LandedvsPIT_Flag,
+    Median_SCCOGS_hist,
+    SCCOGS_hist_LandedvsPIT_Flag,
+    
+    -- Commercial Metrics
+    GRS_Monthly_Agg,
+    Visits_Monthly_Agg,
+    CR_Monthly_Avg,
+    
+    -- Ops & Merch: AD Tag coverage (Merch), Leadtime (TTD), RPI (competitiveness), OOS (Inventory levels) - Aggregated over the last 30 days
+    ADTagCoverage_Monthly_Avg,
+    
+    Leadtime_Est_Monthly_Avg, -- The estimate is in days
+    Leadtime_Est_Granularity_hist, -- Indicates whether the estimate is on SKU, supplier, class or category level 
+    
+    -- Deleted RPI0_Monthly_Avg as it's the same as RPI28_Monthly_Avg on SKU level
+    RPI28_Monthly_Avg,
+    LiMCompetitor_hist,
+    
+    OOSFreqPct_Monthly_Avg,
+    
+    -- Percentile ranks
+    ROUND(Median_WSC_Hist_PctRank, 2) AS Median_WSC_Hist_PctRank,
+    ROUND(RAR_Hist_PctRank, 2) AS RAR_Hist_PctRank,
+    ROUND(Inc_And_SC_ShareOfCOGS_Hist_PctRank, 2) AS Inc_And_SC_ShareOfCOGS_Hist_PctRank,
+    ROUND(SCCOGS_Hist_PctRank, 2) AS SCCOGS_Hist_PctRank,
+    ROUND(GRS_Hist_PctRank, 2) AS GRS_Hist_PctRank,
+    ROUND(Visits_Hist_PctRank, 2) AS Visits_Hist_PctRank,
+    ROUND(CR_Hist_PctRank, 2) AS CR_Hist_PctRank,
+    ROUND(ADTagCoverage_Hist_PctRank, 2) AS ADTagCoverage_Hist_PctRank,
+    ROUND(Leadtime_Est_Hist_PctRank, 2) AS Leadtime_Est_Hist_PctRank,
+    ROUND(RPI28_Hist_PctRank, 2) AS RPI28_Hist_PctRank,
+    ROUND(OOS_Hist_PctRank, 2) AS OOS_Hist_PctRank,
+
+    ben.DataPullTimeStamp
+  FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_all_benchmarks_anchors_plus_nn_de_catalog` ben
+  LEFT JOIN (
+    SELECT
+        Anchor_SKU,
+        ARRAY_TO_STRING(Top10NNs, ', ') AS Top_10_Nearest_Neighbors
+    FROM (SELECT Anchor_SKU, ARRAY_AGG(NNs ORDER BY NN_rank ASC LIMIT 10) AS Top10NNs FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hedwig_scores_parsed_de_catalog` GROUP BY 1)
+  ) nn ON ben.Anchor_SKU = nn.Anchor_SKU -- This LEFT JOIN is used to display the top 10 NNs next to each anchor SKU
+  WHERE NN_rank = 0 -- This WHERE clause makes sure that we ONLY select the anchors
+  ORDER BY 2,3,4,6,9,1
+) hist
+LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_class` cl ON hist.ClID = cl.ClID
+LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_product.tbl_marketing_category` mkc ON hist.MkcID = mkc.MkcID
+LEFT JOIN `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_wsc_rev_de_catalog` wsc ON hist.SoID = wsc.SoID AND hist.Anchor_SKU = wsc.PrSKU AND hist.Datum = wsc.Datum
+LEFT JOIN `wf-gcp-us-ae-bulk-prod.csn_pricing.tbl_class_designation` des ON hist.SoID = CASE WHEN des.BclgID = 2 THEN 321 WHEN des.BclgID = 3 THEN 368 END AND hist.ClID = des.ClID -- To get the branded/differentiated class designation
+ORDER BY 2,3,4,6,10,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 4.2.1: Converting the table above in step 4.2 to "Long" format so that it fits in Data Studio
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_long_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_long_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+    Datum, 
+    Store_ID, 
+    BclgID, 
+    Category_ID, 
+    Category_Name, 
+    Class_ID, 
+    Class_Name, 
+    Class_Designation, 
+    Supplier_ID, 
+    SKU, 
+    Top_10_Nearest_Neighbors, 
+    KPI, 
+    SAFE_CAST(Value AS FLOAT64) AS Value
+FROM (
+    SELECT 
+        Datum, 
+        Store_ID, 
+        BclgID, 
+        Category_ID, 
+        Category_Name, 
+        Class_ID, 
+        Class_Name, 
+        Class_Designation, 
+        Supplier_ID, 
+        SKU, 
+        Top_10_Nearest_Neighbors,  
+        REGEXP_REPLACE(SPLIT(pair, ':')[SAFE_OFFSET(0)], r'^"|"$', '') KPI, 
+        REGEXP_REPLACE(SPLIT(pair, ':')[SAFE_OFFSET(1)], r'^"|"$', '') Value 
+    FROM (
+        SELECT -- Query for the columns whose type is FLOAT64
+            -- Grouping columns
+            Datum, 
+            Store_ID, 
+            BclgID, 
+            Category_ID, 
+            Category_Name, 
+            Class_ID, 
+            Class_Name, 
+            Class_Designation, 
+            Supplier_ID, 
+            SKU, 
+            Top_10_Nearest_Neighbors,
+
+            -- Columns whose type is FLOAT64
+            -- Absolute metrics
+            Wholesale_Cost_Absolute,
+            Post_Order_Costs_Absolute,
+            Shipcosts_And_Incidences_Absolute,
+            Shipcosts_Absolute,
+            Order_Delivery_Time_Absolute,
+            Out_Of_Stock_Absolute,
+            Merchandising_Absolute,
+            RPI_Absolute,
+            Revenue_Absolute,
+            WSC_Revenue,
+            Conversion_Rate_Absolute,
+            Visits_Absolute,
+            
+            -- Percentile ranks
+            Wholesale_Cost,
+            Post_Order_Costs,
+            Shipcosts_And_Incidences,
+            Shipcosts,
+            Order_Delivery_Time,
+            Out_Of_Stock,
+            Merchandising,
+            RPI,
+            Revenue,
+            ROUND(Visits, 0) AS Visits,
+            Conversion_Rate,
+        FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog`) t,
+    UNNEST(SPLIT(REGEXP_REPLACE(to_json_string(t), r'{|}', ''))) pair
+)
+WHERE KPI IN ('Wholesale_Cost_Absolute', 'Post_Order_Costs_Absolute', 'Shipcosts_And_Incidences_Absolute', 'Shipcosts_Absolute', 'Order_Delivery_Time_Absolute', 'Out_Of_Stock_Absolute', 'Merchandising_Absolute', 'RPI_Absolute', 'Revenue_Absolute', 'WSC_Revenue', 'Conversion_Rate_Absolute', 'Visits_Absolute', 'Wholesale_Cost', 'Post_Order_Costs', 'Shipcosts_And_Incidences', 'Shipcosts', 'Order_Delivery_Time', 'Out_Of_Stock', 'Merchandising', 'RPI', 'Revenue', 'Visits', 'Conversion_Rate')
+ORDER BY 2,3,4,6,SKU,1,KPI;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 4.3.2: Forming a new table from "cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_long" that excludes rows based on the criteria below. Can serve as a replacement for the original table in case we run into data studio issues
+
+/*
+Criteria for excluding rows:
+
+1- Remove branded classes
+2- Remove unneeded columns
+3- Limit to the top 200 classes (not used here because the first two conditions suffice)
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_excl_br_de_catalog_long_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_excl_br_de_catalog_long_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT * EXCEPT(Store_ID, Category_ID, Class_Name)
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_long`
+WHERE Class_Designation != 'Branded Class'
+ORDER BY 2,3,4,6,SKU,1,KPI;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 4.3: Aggregating the percentile ranks across all SKUs to come up with the overarching story for the historical metrics. We revenue-weight the percentile ranks and do **not** perform a normal average
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+
+  -- Grouping variables
+  Datum,
+  Store_ID,
+  BclgID,
+  Category_ID,
+  Category_Name,
+  Class_ID,
+  Class_Name,
+  Class_Designation,
+  Supplier_ID,
+
+  -- Fillers
+  'Aggregated Supplier-Class Level' AS Table_Identifier,
+  'NA' AS Top_10_Nearest_Neighbors,
+
+  -- Absolute Metrics
+  -- WSC and COGS
+  Avg_WSC AS Wholesale_Cost_Absolute,
+  NULL AS WSC_LandedvsPIT_Flag,
+  RevW_Avg_RAR AS Post_Order_Costs_Absolute,
+  NULL AS Post_Order_Costs_LandedvsPIT_Flag,
+  RevW_Avg_Inc_And_ShipCost_ShareOfCOGS AS Shipcosts_And_Incidences_Absolute,
+  NULL AS Shipcosts_And_Incidences_LandedvsPIT_Flag,
+  RevW_Avg_SCCOGS AS Shipcosts_Absolute,
+  NULL AS Shipcosts_LandedvsPIT_Flag,
+  
+  -- Ops & Merch: AD Tag coverage (Merch), Leadtime (TTD), RPI (competitiveness), OOS (Inventory levels)
+  Avg_Leadtime AS Order_Delivery_Time_Absolute,
+  NULL AS Order_Delivery_Time_Granularity,
+  Avg_OOS AS Out_Of_Stock_Absolute,
+  Avg_ADTagCoverage AS Merchandising_Absolute,
+  Avg_RPI AS RPI_Absolute,
+  NULL AS Lowest_In_Market_Competitor,
+
+  -- Output Commercial Metrics
+  Sum_GRS AS Revenue_Absolute,
+  Sum_WSC_Revenue AS WSC_Revenue,
+  Sum_Visits AS Visits_Absolute,
+  Avg_CR AS Conversion_Rate_Absolute,
+
+  -- Percentile ranks
+  -- WSC and COGS
+  WSC_RevWAvgPctRank_All AS Wholesale_Cost,
+  RAR_RevWAvgPctRank_All AS Post_Order_Costs,
+  Inc_And_SC_ShareOfCOGS_RevWAvgPctRank_All AS Shipcosts_And_Incidences,
+  SCCOGS_RevWAvgPctRank_All AS Shipcosts,
+  
+  -- Ops & Merch: AD Tag coverage (Merch), Leadtime (TTD), RPI (competitiveness), OOS (Inventory levels)
+  Leadtime_RevWAvgPctRank_All AS Order_Delivery_Time,
+  OOS_RevWAvgPctRank_All AS Out_Of_Stock,
+  ADTagCoverage_RevWAvgPctRank_All AS Merchandising,
+  RPI_RevWAvgPctRank_All AS RPI,
+
+  -- Output Commercial metrics
+  GRS_RevWAvgPctRank_All AS Revenue,
+  CR_RevWAvgPctRank_All AS Conversion_Rate,
+  Visits_RevWAvgPctRank_All AS Visits,
+
+  DataPullTimeStamp,
+  
+FROM (
+  SELECT 
+    -- Grouping Variables
+    Datum,
+    Store_ID,
+    BclgID,
+    Category_ID,
+    Category_Name,
+    Class_ID,
+    Class_Name,
+    Class_Designation,
+    REPLACE(SuIDs, " ","") AS Supplier_ID, -- This is the field from the sub-query after the "FROM" statement. Sometimes, there are spaces that result from the CROSS JOIN statement below. We eliminate them through the REPLACE command
+
+    -- Aggregation of metrics
+    -- WSC and COGS
+    ROUND(AVG(Wholesale_Cost_Absolute), 2) AS Avg_WSC,
+    ROUND(SUM(Post_Order_Costs_Absolute * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS RevW_Avg_RAR,
+    ROUND(SUM(Shipcosts_And_Incidences_Absolute * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS RevW_Avg_Inc_And_ShipCost_ShareOfCOGS,
+    ROUND(SUM(Shipcosts_Absolute * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS RevW_Avg_SCCOGS,    
+    
+    -- Ops & Merch
+    ROUND(AVG(Order_Delivery_Time_Absolute), 2) AS Avg_Leadtime,
+    NULL AS Order_Delivery_Time_Granularity,
+    ROUND(AVG(Out_Of_Stock_Absolute), 2) AS Avg_OOS,
+    ROUND(AVG(Merchandising_Absolute), 2) AS Avg_ADTagCoverage,
+    ROUND(AVG(RPI_Absolute), 4) AS Avg_RPI,
+    NULL AS Lowest_In_Market_Competitor,
+
+    -- Output Commercial Metrics
+    ROUND(SUM(Revenue_Absolute), 2) AS Sum_GRS,
+    ROUND(SUM(WSC_Revenue), 2) AS Sum_WSC_Revenue,
+    SUM(Visits_Absolute) AS Sum_Visits,
+    ROUND(AVG(Conversion_Rate_Absolute), 4) AS Avg_CR,
+
+    -- Aggregation of percentile ranks (revenue-weighting instead of normal average)
+    -- WSC and COGS
+    ROUND(SUM(Wholesale_Cost * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS WSC_RevWAvgPctRank_All,
+    ROUND(SUM(Post_Order_Costs * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS RAR_RevWAvgPctRank_All,
+    ROUND(SUM(Shipcosts_And_Incidences * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS Inc_And_SC_ShareOfCOGS_RevWAvgPctRank_All,
+    ROUND(SUM(Shipcosts * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS SCCOGS_RevWAvgPctRank_All,
+    
+    -- Ops & Merch
+    ROUND(SUM(Order_Delivery_Time * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS Leadtime_RevWAvgPctRank_All,
+    ROUND(SUM(Out_Of_Stock * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS OOS_RevWAvgPctRank_All,
+    ROUND(SUM(Merchandising * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS ADTagCoverage_RevWAvgPctRank_All,
+    ROUND(SUM(RPI * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS RPI_RevWAvgPctRank_All,
+
+    -- Output Commercial Metrics
+    ROUND(SUM(Revenue * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS GRS_RevWAvgPctRank_All,
+    ROUND(SUM(Conversion_Rate * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS CR_RevWAvgPctRank_All,
+    ROUND(SUM(Visits * Revenue_Absolute) / NULLIF(SUM(Revenue_Absolute), 0), 2) AS Visits_RevWAvgPctRank_All,
+
+    DataPullTimeStamp
+
+  FROM (
+    SELECT * EXCEPT(Supplier_ID)
+    FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog` a
+    CROSS JOIN UNNEST(SPLIT(SUBSTR(Supplier_ID, 2, LENGTH(Supplier_ID) - 2))) AS SuIDs -- Splits the SuID string into an array and cross joins to every record in the table above. This will produce duplicate records due to the one-to-many relationship between SKUs and suppliers
+  )
+  GROUP BY 1,2,3,4,5,6,7,8,9,DataPullTimeStamp
+)
+ORDER BY 2,3,4,6,9,1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 4.3.1: Converting the table above in step 4.2 to "Long" format so that it fits in Data Studio
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog_long_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog_long_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT 
+    Datum, 
+    Store_ID, 
+    BclgID, 
+    Category_ID, 
+    Category_Name, 
+    Class_ID, 
+    Class_Name, 
+    Class_Designation, 
+    Supplier_ID, 
+    KPI, 
+    SAFE_CAST(Value AS FLOAT64) AS Value
+FROM (
+    SELECT 
+        Datum, 
+        Store_ID, 
+        BclgID, 
+        Category_ID, 
+        Category_Name, 
+        Class_ID, 
+        Class_Name, 
+        Class_Designation, 
+        Supplier_ID, 
+        REGEXP_REPLACE(SPLIT(pair, ':')[SAFE_OFFSET(0)], r'^"|"$', '') KPI, 
+        REGEXP_REPLACE(SPLIT(pair, ':')[SAFE_OFFSET(1)], r'^"|"$', '') Value 
+    FROM (
+        SELECT -- Query for the columns whose type is FLOAT64
+            -- Grouping columns
+            Datum, 
+            Store_ID, 
+            BclgID, 
+            Category_ID, 
+            Category_Name, 
+            Class_ID, 
+            Class_Name, 
+            Class_Designation, 
+            Supplier_ID, 
+
+            -- Columns whose type is FLOAT64
+            -- Absolute metrics
+            Wholesale_Cost_Absolute,
+            Post_Order_Costs_Absolute,
+            Shipcosts_And_Incidences_Absolute,
+            Shipcosts_Absolute,
+            Order_Delivery_Time_Absolute,
+            Out_Of_Stock_Absolute,
+            Merchandising_Absolute,
+            RPI_Absolute,
+            Revenue_Absolute,
+            WSC_Revenue,
+            Conversion_Rate_Absolute,
+            Visits_Absolute,
+
+            -- Percentile ranks
+            Wholesale_Cost,
+            Post_Order_Costs,
+            Shipcosts_And_Incidences,
+            Shipcosts,
+            Order_Delivery_Time,
+            Out_Of_Stock,
+            Merchandising,
+            RPI,
+            Revenue,
+            ROUND(Visits, 0) AS Visits,
+            Conversion_Rate,
+        FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog`) t,
+    UNNEST(SPLIT(REGEXP_REPLACE(to_json_string(t), r'{|}', ''))) pair
+)
+WHERE KPI IN ('Wholesale_Cost_Absolute', 'Post_Order_Costs_Absolute', 'Shipcosts_And_Incidences_Absolute', 'Shipcosts_Absolute', 'Order_Delivery_Time_Absolute', 'Out_Of_Stock_Absolute', 'Merchandising_Absolute', 'RPI_Absolute', 'Revenue_Absolute', 'WSC_Revenue', 'Conversion_Rate_Absolute', 'Visits_Absolute', 'Wholesale_Cost', 'Post_Order_Costs', 'Shipcosts_And_Incidences', 'Shipcosts', 'Order_Delivery_Time', 'Out_Of_Stock', 'Merchandising', 'RPI', 'Revenue', 'Visits', 'Conversion_Rate')
+ORDER BY 2,3,4,6,Supplier_ID,1,KPI;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Step 4.3.2: Forming a new table from "cm_fp_hist_overarching_stories_de_catalog_long" that excludes rows based on the criteria below. Can serve as a replacement for the original table in case we run into data studio issues
+
+/*
+Criteria for excluding rows:
+
+1- Remove branded classes
+2- Remove unneeded columns
+3- Limit to the top 200 classes (not used here because the first two conditions suffice)
+*/
+
+DROP TABLE IF EXISTS `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_excl_br_de_catalog_long_static`;
+CREATE TABLE `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_excl_br_de_catalog_long_static`
+OPTIONS(
+  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 100 DAY)
+) AS
+
+SELECT * EXCEPT(Store_ID, Category_ID, Class_Name)
+FROM `wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog_long`
+WHERE Class_Designation != 'Branded Class'
+ORDER BY 2,3,4,6,Supplier_ID,1,KPI;
+

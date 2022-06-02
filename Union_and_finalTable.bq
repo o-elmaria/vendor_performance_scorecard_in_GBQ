@@ -1,0 +1,128 @@
+CREATE OR REPLACE TABLE
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_both_catalog_static` AS (
+SELECT *
+FROM
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_de_catalog_static`
+UNION ALL
+
+SELECT *
+FROM
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_uk_catalog_static` );
+
+----------------------Union of both Catalogs at Su Class Level----------------------------------------------
+
+CREATE OR REPLACE TABLE
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_both_catalog_static` AS (
+SELECT *
+FROM
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_uk_catalog_static`
+
+UNION ALL
+
+SELECT *
+FROM
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_de_catalog_static` );
+
+
+
+--------------------------------------Final Table for Hist+pit-----------------------------------------------------------
+---Sku level---
+
+CREATE OR REPLACE TABLE
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_static_monthly_pit_curated_benchmarks_anchors_only_both_catalogs` AS (
+SELECT
+  Datum,
+  Store_ID,
+  BclgID,
+  Category_ID,
+  Category_Name,
+  Class_ID,
+  Class_Name,
+  Class_Designation,
+  Supplier_ID,
+  SKU,
+  Top_10_Nearest_Neighbors,
+  Wholesale_Cost_Absolute,
+  WSC_LandedvsPIT_Flag,
+  Post_Order_Costs_Absolute,
+  Post_Order_Costs_LandedvsPIT_Flag,
+  Shipcosts_And_Incidences_Absolute,
+  Shipcosts_And_Incidences_LandedvsPIT_Flag,
+  Shipcosts_Absolute,
+  Shipcosts_LandedvsPIT_Flag,
+  Order_Delivery_Time_Absolute,
+  Order_Delivery_Time_Granularity,
+  Out_Of_Stock_Absolute,
+  Merchandising_Absolute,
+  RPI_Absolute,
+  LiMCompetitor_hist,
+  Revenue_Absolute,
+  CAST(NULL AS NUMERIC) AS GRS90D,
+  Visits_Absolute,
+  Conversion_Rate_Absolute,
+  Wholesale_Cost,
+  Post_Order_Costs,
+  Shipcosts_And_Incidences,
+  Shipcosts,
+  Order_Delivery_Time,
+  Out_Of_Stock,
+  Merchandising,
+  RPI,
+  Revenue,
+  Visits,
+  Conversion_Rate,
+  NULL AS Pattern,
+  " " AS RecommendedAction,
+  CURRENT_TIMESTAMP() AS DataPullTimeStamp
+FROM
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_curated_benchmarks_anchors_only_both_catalog_static` );
+
+----Su Class Level----------------------
+CREATE OR REPLACE TABLE
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_static_monthly_pit_overarching_summary_both_catalogs` AS (
+SELECT
+  Datum,
+  Store_ID,
+  BclgID,
+  Category_ID,
+  Category_Name,
+  Class_ID,
+  Class_Name,
+  Class_Designation,
+  Supplier_ID,
+  Table_Identifier,
+  Top_10_Nearest_Neighbors,
+  Wholesale_Cost_Absolute,
+  WSC_LandedvsPIT_Flag,
+  Post_Order_Costs_Absolute,
+  Post_Order_Costs_LandedvsPIT_Flag,
+  Shipcosts_And_Incidences_Absolute,
+  Shipcosts_And_Incidences_LandedvsPIT_Flag,
+  Shipcosts_Absolute,
+  Shipcosts_LandedvsPIT_Flag,
+  Order_Delivery_Time_Absolute,
+  Order_Delivery_Time_Granularity,
+  Out_Of_Stock_Absolute,
+  Merchandising_Absolute,
+  RPI_Absolute,
+  Lowest_In_Market_Competitor AS LiMCompetitor,
+  Revenue_Absolute,
+  CAST(NULL AS NUMERIC) AS GRS90D ,
+  Conversion_Rate_Absolute,
+  Visits_Absolute,
+  Wholesale_Cost,
+  Post_Order_Costs,
+  Shipcosts_And_Incidences,
+  Shipcosts,
+  Order_Delivery_Time,
+  Out_Of_Stock,
+  Merchandising,
+  RPI,
+  Revenue,
+  Conversion_Rate,
+  Visits,
+  NULL AS Overarching_Pattern,
+  " " AS Overarching_RecommendedAction,
+  CURRENT_TIMESTAMP() AS DataPullTimeStamp
+FROM
+`wf-gcp-us-ae-pricing-prod.eu_profit_mgmt.cm_fp_hist_overarching_stories_both_catalog_static` );
